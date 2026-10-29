@@ -1,0 +1,16 @@
+{
+  "name": "segy-analyzer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "observable preview",
+    "build": "observable build",
+    "clean": "rimraf src/.observablehq/cache"
+  },
+  "dependencies": {
+    "@observablehq/framework": "^1.13.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

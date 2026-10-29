@@ -1,0 +1,860 @@
+<!doctype html>
+<notebook>
+  <title>SEG-Y analyzer</title>
+  <script id="1" type="text/markdown">
+    # SEG-Y analyzer
+
+    Analyse SEG-Y files. Files are not uploaded to a server; they are read locally by your browser.
+    Big and little endian files are both handled, as are ASCII and EBCDIC text headers.
+    An EBCDIC textual 3200 byte header and a 400 byte binary header are expected to exist. A future option is to add a switch to enable Seismic Unix, or other formats, which do not have these headers, but have existing 240 byte trace headers.
+
+    ## 1. Provide file
+  </script>
+  <script id="2" type="module">
+    // EBCDIC (IBM037) to Unicode lookup for the fallback path.
+    // Built from the common cp037 mapping; unmapped bytes become a space.
+    const CP037 = (() => {
+      const t = new Array(256).fill(" ");
+      const put = (start, str) => [...str].forEach((c, i) => (t[start + i] = c));
+      put(0x40, " ");
+      put(0x4a, "\u00a2.<(+|&");
+      put(0x5a, "!$*);\u00ac-/");
+      put(0x6a, "\u00a6,%_>?");
+      put(0x79, "`:#@'=\"");
+      put(0x81, "abcdefghi");
+      put(0x91, "jklmnopqr");
+      put(0xa1, "~stuvwxyz");
+      put(0xc0, "{ABCDEFGHI");
+      put(0xd0, "}JKLMNOPQR");
+      put(0xe0, "\\ STUVWXYZ");
+      put(0xf0, "0123456789");
+      return t;
+    })();
+
+    function looksAscii(bytes) {
+      // Printable ASCII spaces (0x20) and letters dominate in ASCII headers.
+      // In EBCDIC, 0x40 is the space and 0xC1-0xE9 are letters.
+      let ascii = 0, ebcdic = 0;
+      for (const b of bytes) {
+        if (b === 0x20 || (b >= 0x41 && b <= 0x7a)) ascii++;
+        if (b === 0x40 || (b >= 0xc1 && b <= 0xe9) || (b >= 0xf0 && b <= 0xf9)) ebcdic++;
+      }
+      return ascii > ebcdic;
+    }
+
+    function decodeEbcdic(bytes) {
+      try {
+        return new TextDecoder("ibm037").decode(bytes);
+      } catch {
+        return Array.from(bytes, (b) => CP037[b]).join("");
+      }
+    }
+
+    /**
+     * Returns { encoding, lines } where lines is an array of 40 strings of 80 chars.
+     */
+    function decodeTextHeader(buffer, offset = 0, length = 3200) {
+      const bytes = new Uint8Array(buffer, offset, length);
+      const ascii = looksAscii(bytes);
+      const text = ascii ? new TextDecoder("ascii").decode(bytes) : decodeEbcdic(bytes);
+      const lines = [];
+      for (let i = 0; i < text.length; i += 80) lines.push(text.slice(i, i + 80).trimEnd());
+      return { encoding: ascii ? "ASCII" : "EBCDIC (IBM037)", lines };
+    }
+  </script>
+  <script id="3" type="module">
+    const FORMATS = {
+      1: { size: 4, txt: "4-byte IBM floating-point" },
+      2: { size: 4, txt: "4-byte two's complement integer" },
+      3: { size: 2, txt: "2-byte two's complement integer" },
+      5: { size: 4, txt: "4-byte IEEE floating-point" },
+      6: { size: 8, txt: "8-byte IEEE floating-point" },
+      8: { size: 1, txt: "1-byte two's complement integer" },
+      9: { size: 8, txt: "8-byte two's complement integer" },
+      10: { size: 4, txt: "4-byte unsigned integer" },
+      11: { size: 2, txt: "2-byte unsigned integer" },
+      16: { size: 1, txt: "1-byte unsigned integer" }
+    };
+
+    const TEXT_HEADER = 3200;
+    const BIN_HEADER = 400;
+    const TRACE_HEADER = 240;
+
+    function ibmToFloat(u32) {
+      const sign = u32 >>> 31 ? -1 : 1;
+      const exponent = (u32 >>> 24) & 0x7f;
+      const fraction = (u32 & 0x00ffffff) / 0x1000000;
+      return sign * fraction * Math.pow(16, exponent - 64);
+    }
+
+    class SegY {
+      constructor(buffer) {
+        this.buffer = buffer;
+        const view = new DataView(buffer, TEXT_HEADER, BIN_HEADER);
+
+        // Byte order check: 16909060 (0x01020304) when big endian.
+        const marker = view.getInt32(96, false);
+        this.littleEndian = marker === 0x04030201;
+        const le = this.littleEndian;
+
+        this.binary = {
+          jobId: view.getInt32(0, le),
+          lineNo: view.getInt32(4, le),
+          reelNo: view.getInt32(8, le),
+          tracesPerEnsemble: view.getInt16(12, le),
+          dt: view.getInt16(16, le),
+          ns: view.getInt16(20, le),
+          format: view.getInt16(24, le),
+          revMajor: view.getUint8(300),
+          revMinor: view.getUint8(301),
+          fixedLength: view.getInt16(302, le),
+          extHeaders: view.getInt16(304, le)
+        };
+        // Revision 2 extended fields override the 16-bit ones when nonzero.
+        const extNs = view.getInt32(68, le);
+        if (extNs > 0) this.binary.ns = extNs;
+
+        const fmt = FORMATS[this.binary.format];
+        if (!fmt) throw new Error(`Unsupported sample format code ${this.binary.format}`);
+        this.fmt = fmt;
+        this.dataStart = TEXT_HEADER + BIN_HEADER + Math.max(0, this.binary.extHeaders) * 3200;
+        this.traceBytes = TRACE_HEADER + this.binary.ns * fmt.size;
+        this.traceCount = Math.floor((buffer.byteLength - this.dataStart) / this.traceBytes);
+      }
+
+      traceStart(trace) {
+        return this.dataStart + (trace - 1) * this.traceBytes;
+      }
+
+      headerInt(trace, offset, size = 4) {
+        const view = new DataView(this.buffer, this.traceStart(trace), TRACE_HEADER);
+        return size === 2
+          ? view.getInt16(offset - 1, this.littleEndian)
+          : view.getInt32(offset - 1, this.littleEndian);
+      }
+
+      /** Value of one trace header field from the spec, handling 2, 4, 6 and 8 byte fields. */
+      headerValue(trace, field) {
+        const view = new DataView(this.buffer, this.traceStart(trace), TRACE_HEADER);
+        const le = this.littleEndian;
+        const o = field.offset - 1;
+        switch (field.size) {
+          case 2: return view.getInt16(o, le);
+          case 4: return view.getInt32(o, le);
+          case 6:
+            if (o === 218) {
+              // vertical, crossline, inline components, in tenths
+              return [view.getInt16(o, le), view.getInt16(o + 2, le), view.getInt16(o + 4, le)]
+                .map((v) => v / 10).join(", ");
+            }
+            // 32-bit mantissa and exponent byte, as in the original notebook
+            return view.getInt32(o, le) * Math.pow(10, view.getInt8(o + 4));
+          case 8: return "0x" + view.getBigUint64(o, le).toString(16);
+          default: return null;
+        }
+      }
+
+      /** 16 and 32 bit signed values at a 1-based byte offset in the 400 byte binary header. */
+      binaryValue(offset) {
+        const view = new DataView(this.buffer, TEXT_HEADER, BIN_HEADER);
+        const o = offset - 1;
+        const le = this.littleEndian;
+        return {
+          int16: o >= 0 && o + 2 <= BIN_HEADER ? view.getInt16(o, le) : null,
+          int32: o >= 0 && o + 4 <= BIN_HEADER ? view.getInt32(o, le) : null
+        };
+      }
+
+      samples(trace) {
+        const ns = this.headerInt(trace, 115, 2) || this.binary.ns;
+        const n = Math.min(ns, this.binary.ns);
+        const view = new DataView(this.buffer, this.traceStart(trace) + TRACE_HEADER, n * this.fmt.size);
+        const le = this.littleEndian;
+        const size = this.fmt.size;
+        const out = new Float32Array(n);
+        let min = Infinity, max = -Infinity;
+        for (let i = 0; i < n; i++) {
+          const p = i * size;
+          let v;
+          switch (this.binary.format) {
+            case 1: v = ibmToFloat(view.getUint32(p, le)); break;
+            case 2: v = view.getInt32(p, le); break;
+            case 3: v = view.getInt16(p, le); break;
+            case 5: v = view.getFloat32(p, le); break;
+            case 6: v = view.getFloat64(p, le); break;
+            case 8: v = view.getInt8(p); break;
+            case 9: v = Number(view.getBigInt64(p, le)); break;
+            case 10: v = view.getUint32(p, le); break;
+            case 11: v = view.getUint16(p, le); break;
+            case 16: v = view.getUint8(p); break;
+            default: v = 0;
+          }
+          out[i] = v;
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+        return { values: out, min, max };
+      }
+
+      /** Reads two 32-bit header words for every trace, e.g. X and Y coordinates. */
+      coordinates(offsetX, offsetY, maxPoints = 20000) {
+        const step = Math.max(1, Math.floor(this.traceCount / maxPoints));
+        const pts = [];
+        for (let t = 1; t <= this.traceCount; t += step) {
+          pts.push({ trace: t, x: this.headerInt(t, offsetX), y: this.headerInt(t, offsetY) });
+        }
+        return pts;
+      }
+
+      /** Subsampled amplitude matrix for the section viewer. */
+      section(centerTrace, halfWindow = 500, maxTraces = 1000, maxSamples = 1000) {
+        const first = Math.max(1, centerTrace - halfWindow);
+        const last = Math.min(this.traceCount, centerTrace + halfWindow);
+        const tStep = Math.max(1, Math.ceil((last - first + 1) / maxTraces));
+        const sStep = Math.max(1, Math.ceil(this.binary.ns / maxSamples));
+        const cols = [];
+        let min = Infinity, max = -Infinity;
+        for (let t = first; t <= last; t += tStep) {
+          const s = this.samples(t);
+          if (s.min < min) min = s.min;
+          if (s.max > max) max = s.max;
+          const col = new Float32Array(Math.ceil(s.values.length / sStep));
+          for (let i = 0, j = 0; i < s.values.length; i += sStep, j++) col[j] = s.values[i];
+          cols.push(col);
+        }
+        return { cols, min, max, first, last, tStep, sStep, dt: this.binary.dt * sStep / 1e6 };
+      }
+    }
+
+    /** Reads a File (or Observable FileAttachment) in chunks and reports progress. */
+    async function readFile(file, onProgress = () => {}) {
+      // Inputs.file gives a FileAttachment-like object whose stream() is async.
+      const stream = await file.stream();
+      const reader = stream.getReader();
+      const size = file.size || 0;
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.length;
+        if (size) onProgress(total / size);
+      }
+      const out = new Uint8Array(total);
+      let pos = 0;
+      for (const c of chunks) { out.set(c, pos); pos += c.length; }
+      return out.buffer;
+    }
+  </script>
+  <script id="4" type="module">
+    // Pick "nice" tick values (1, 2, 5 x 10^k) inside [min, max].
+    function niceTicks(min, max, count, minStep = 0) {
+      const range = Math.max(max - min, 1e-12);
+      const raw = range / Math.max(1, count);
+      const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+      const f = raw / pow;
+      const nice = f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10;
+      const step = Math.max(nice * pow, minStep);
+      const decimals = Math.max(0, Math.ceil(-Math.log10(step) - 1e-9));
+      const values = [];
+      for (let v = Math.ceil(min / step - 1e-9) * step; v <= max + step * 1e-9; v += step) {
+        values.push(Math.round(v / step) * step);
+      }
+      return { values, decimals };
+    }
+
+    function sectionViewer(
+      section,
+      { width = 900, height = 600, contrast = 0.2, brightness = 0.5, smooth = true, invert = false } = {}
+    ) {
+      const margin = { top: 10, right: 15, bottom: 48, left: 62 };
+      const pw = Math.max(50, width - margin.left - margin.right); // plot area size in canvas pixels
+      const ph = Math.max(50, height - margin.top - margin.bottom);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.cssText = "display:block;width:100%;max-width:" + width + "px;cursor:grab;touch-action:none";
+      const ctx = canvas.getContext("2d");
+
+      const cols = section.cols.length;
+      const rows = section.cols[0].length;
+
+      // Render the amplitude data once into an offscreen canvas.
+      const off = document.createElement("canvas");
+      off.width = cols;
+      off.height = rows;
+      const octx = off.getContext("2d");
+      const img = octx.createImageData(cols, rows);
+      const range = section.max - section.min || 1;
+      // (Re)render the grey scale image; needed again only when contrast, brightness or invert change.
+      function renderImage() {
+        const stretch = (v) => (v - 127.5 + (brightness - 0.5) * 255) / (1 - contrast) + 127.5;
+        for (let x = 0; x < cols; x++) {
+          const col = section.cols[x];
+          for (let y = 0; y < rows; y++) {
+            const g = Math.max(0, Math.min(255, stretch(((col[y] - section.min) / range) * 255)));
+            const i = (y * cols + x) * 4;
+            const v = invert ? 255 - g : g;
+            img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+            img.data[i + 3] = 255;
+          }
+        }
+        octx.putImageData(img, 0, 0);
+      }
+      renderImage();
+
+      // Scale x and y independently so the section always fills the plot area.
+      // Zoom changes both by the same factor. tx, ty are relative to the plot area origin.
+      const fit = () => ({ sx: pw / cols, sy: ph / rows });
+      let { sx, sy } = fit();
+      let tx = 0, ty = 0;
+      const reset = () => { ({ sx, sy } = fit()); tx = ty = 0; draw(); };
+
+      // Image column c (continuous, cell i centered at i + 0.5) <-> trace number, row r <-> time in s.
+      const traceAt = (c) => section.first + (c - 0.5) * section.tStep;
+      const colOf = (trace) => (trace - section.first) / section.tStep + 0.5;
+      const timeAt = (r) => (r - 0.5) * section.dt;
+      const rowOf = (time) => time / section.dt + 0.5;
+
+      function draw() {
+        const cs = getComputedStyle(canvas);
+        const fg = cs.color || "#888";
+        const font = `12px ${cs.fontFamily || "sans-serif"}`;
+        ctx.clearRect(0, 0, width, height);
+
+        // image, clipped to the plot area
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(margin.left, margin.top, pw, ph);
+        ctx.clip();
+        ctx.imageSmoothingEnabled = smooth;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(off, margin.left + tx, margin.top + ty, cols * sx, rows * sy);
+        ctx.restore();
+
+        // axes
+        ctx.strokeStyle = fg;
+        ctx.fillStyle = fg;
+        ctx.lineWidth = 1;
+        ctx.font = font;
+        ctx.globalAlpha = 0.7;
+        ctx.strokeRect(margin.left + 0.5, margin.top + 0.5, pw, ph);
+
+        // horizontal axis: trace number
+        const c0 = (0 - tx) / sx, c1 = (pw - tx) / sx;
+        const xt = niceTicks(Math.min(traceAt(c0), traceAt(c1)), Math.max(traceAt(c0), traceAt(c1)), Math.floor(pw / 90), 1);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        for (const v of xt.values) {
+          const px = Math.round(margin.left + tx + colOf(v) * sx) + 0.5;
+          if (px < margin.left || px > margin.left + pw) continue;
+          ctx.beginPath();
+          ctx.moveTo(px, margin.top + ph);
+          ctx.lineTo(px, margin.top + ph + 5);
+          ctx.stroke();
+          ctx.fillText(v.toFixed(xt.decimals), px, margin.top + ph + 8);
+        }
+
+        // vertical axis: time in s, increasing downwards
+        const r0 = (0 - ty) / sy, r1 = (ph - ty) / sy;
+        const yt = niceTicks(Math.min(timeAt(r0), timeAt(r1)), Math.max(timeAt(r0), timeAt(r1)), Math.floor(ph / 45));
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        for (const v of yt.values) {
+          const py = Math.round(margin.top + ty + rowOf(v) * sy) + 0.5;
+          if (py < margin.top || py > margin.top + ph) continue;
+          ctx.beginPath();
+          ctx.moveTo(margin.left - 5, py);
+          ctx.lineTo(margin.left, py);
+          ctx.stroke();
+          ctx.fillText(v.toFixed(yt.decimals), margin.left - 8, py);
+        }
+
+        // axis titles
+        ctx.globalAlpha = 1;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText("trace No", margin.left + pw / 2, height - 3);
+        ctx.save();
+        ctx.translate(13, margin.top + ph / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textBaseline = "top";
+        ctx.fillText("time in s", 0, 0);
+        ctx.restore();
+
+        drawLegend(fg, font);
+      }
+
+      // Amplitude color scale in the top left corner of the plot, as in the original notebook.
+      // Vertical bar spanning the amplitudes that map to black and white after contrast and brightness.
+      // Plain decimal labels (no scientific notation) with about 3 significant digits.
+      const formatAmp = (v) => {
+        if (v === 0) return "0";
+        const digits = Math.min(20, Math.max(0, 2 - Math.floor(Math.log10(Math.abs(v)))));
+        const s = v.toFixed(digits);
+        return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
+      };
+      function pageBackground(fg) {
+        for (const el of [document.body, document.documentElement]) {
+          const c = getComputedStyle(el).backgroundColor;
+          if (c && c !== "transparent" && !/rgba\(.*,\s*0\)$/.test(c)) return c;
+        }
+        const m = /\d+/.exec(fg || "");
+        return m && +m[0] > 128 ? "#14171c" : "#ffffff"; // light text implies a dark page
+      }
+      function drawLegend(fg, font) {
+        const bw = 14, bh = 100, pad = 6, gap = 7;
+        const bx = margin.left + 10, by = margin.top + 10;
+        const ampAt = (G) =>
+          section.min + (((G - 127.5) * (1 - contrast) + 127.5 - (brightness - 0.5) * 255) / 255) * range;
+        const a0 = ampAt(0), a1 = ampAt(255);
+        if (!(a1 > a0)) return;
+        const top = formatAmp(a1), bottom = formatAmp(a0);
+
+        ctx.save();
+        ctx.font = font;
+        const textW = (s) => (ctx.measureText(s) || { width: 40 }).width;
+        const labelW = Math.max(textW(top), textW(bottom));
+        const inner = Math.max(textW("amplitude"), bw + gap + labelW);
+        const boxW = inner + 2 * pad, boxH = pad + 16 + bh + pad;
+
+        ctx.globalAlpha = 0.8;
+        ctx.fillStyle = pageBackground(fg);
+        ctx.fillRect(bx, by, boxW, boxH);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = fg;
+        ctx.strokeStyle = fg;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.fillText("amplitude", bx + pad, by + pad);
+
+        const gx = bx + pad, gy = by + pad + 16;
+        const grad = ctx.createLinearGradient(0, gy, 0, gy + bh);
+        grad.addColorStop(0, invert ? "#000000" : "#ffffff"); // high amplitude at the top
+        grad.addColorStop(1, invert ? "#ffffff" : "#000000");
+        ctx.fillStyle = grad;
+        ctx.fillRect(gx, gy, bw, bh);
+        ctx.fillStyle = fg;
+        ctx.globalAlpha = 0.7;
+        ctx.strokeRect(gx + 0.5, gy + 0.5, bw, bh);
+        ctx.globalAlpha = 1;
+
+        // labeled ticks at the two extremes only
+        for (const y of [gy + 0.5, gy + bh + 0.5]) {
+          ctx.beginPath();
+          ctx.moveTo(gx + bw, y);
+          ctx.lineTo(gx + bw + 4, y);
+          ctx.stroke();
+        }
+        ctx.textBaseline = "top";
+        ctx.fillText(top, gx + bw + gap, gy);
+        ctx.textBaseline = "bottom";
+        ctx.fillText(bottom, gx + bw + gap, gy + bh);
+        ctx.restore();
+      }
+
+      canvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const r = canvas.getBoundingClientRect();
+        const mx = ((e.clientX - r.left) / r.width) * width - margin.left;
+        const my = ((e.clientY - r.top) / r.height) * height - margin.top;
+        const k = Math.exp(-e.deltaY * 0.001);
+        tx = mx - (mx - tx) * k;
+        ty = my - (my - ty) * k;
+        sx *= k;
+        sy *= k;
+        draw();
+      }, { passive: false });
+
+      let drag = null;
+      canvas.addEventListener("pointerdown", (e) => {
+        drag = { x: e.clientX, y: e.clientY, tx, ty };
+        canvas.setPointerCapture(e.pointerId);
+        canvas.style.cursor = "grabbing";
+      });
+      canvas.addEventListener("pointermove", (e) => {
+        if (!drag) return;
+        const r = canvas.getBoundingClientRect();
+        tx = drag.tx + ((e.clientX - drag.x) / r.width) * width;
+        ty = drag.ty + ((e.clientY - drag.y) / r.height) * height;
+        draw();
+      });
+      const endDrag = () => { drag = null; canvas.style.cursor = "grab"; };
+      canvas.addEventListener("pointerup", endDrag);
+      canvas.addEventListener("pointercancel", endDrag);
+      canvas.addEventListener("dblclick", reset);
+
+      // Axis colors come from the page's text color, so redraw when the theme changes.
+      const redraw = () => { if (canvas.isConnected) draw(); else stop(); };
+      const observer = new MutationObserver(redraw);
+      observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+      const media = window.matchMedia("(prefers-color-scheme: dark)");
+      media.addEventListener("change", redraw);
+      function stop() {
+        observer.disconnect();
+        media.removeEventListener("change", redraw);
+      }
+
+      // Change display options in place, keeping the current zoom and pan.
+      canvas.update = (o = {}) => {
+        const imageChanged =
+          (o.contrast !== undefined && o.contrast !== contrast) ||
+          (o.brightness !== undefined && o.brightness !== brightness) ||
+          (o.invert !== undefined && o.invert !== invert);
+        if (o.contrast !== undefined) contrast = o.contrast;
+        if (o.brightness !== undefined) brightness = o.brightness;
+        if (o.invert !== undefined) invert = o.invert;
+        if (o.smooth !== undefined) smooth = o.smooth;
+        if (imageChanged) renderImage();
+        draw();
+      };
+
+      draw();
+      requestAnimationFrame(draw); // once attached, the computed text color is available
+      return canvas;
+    }
+  </script>
+  <script id="5" type="module">
+    // Generated from the specTraceHeader table of the original notebook (all 87 fields).
+    const TRACE_HEADER_FIELDS = [
+      {"offset": 1, "size": 4, "range": "1-4", "name": "tracl", "description": "Trace sequence number within line – numbers continue to increase if additional reels are required on same line."},
+      {"offset": 5, "size": 4, "range": "5-8", "name": "tracr", "description": "Trace sequence number within reel – each reel starts at trace number one."},
+      {"offset": 9, "size": 4, "range": "9-12", "name": "fldr", "description": "Original field record number."},
+      {"offset": 13, "size": 4, "range": "13-16", "name": "tracf", "description": "Trace number within the original field record."},
+      {"offset": 17, "size": 4, "range": "17-20", "name": "ep", "description": "Energy source point number – used when more than one record occurs at the same effective surface location."},
+      {"offset": 21, "size": 4, "range": "21-24", "name": "cdp", "description": "Ensemble number: CDP, CMP, CRP, etc."},
+      {"offset": 25, "size": 4, "range": "25-28", "name": "cdpt", "description": "Trace number within the CDP ensemble – each ensemble starts with trace number one."},
+      {"offset": 29, "size": 2, "range": "29-30", "name": "trid", "description": "Trace identification code. -1=other, 0=unknown, 1=seismic, 2=dead, 3=dummy, 4=time-break, 5=uphole, 6=sweep, 7=timing, 8=water-break, etc."},
+      {"offset": 31, "size": 2, "range": "31-32", "name": "nvs", "description": "Number of vertically summed traces yielding this trace. (1 is one trace, 2 is two summed traces, etc.)"},
+      {"offset": 33, "size": 2, "range": "33-34", "name": "nhs", "description": "Number of horizontally stacked traces yielding this trace. (1 is one trace, 2 is two stacked traces, etc.)"},
+      {"offset": 35, "size": 2, "range": "35-36", "name": "duse", "description": "Data use: 1=production, 2=test."},
+      {"offset": 37, "size": 4, "range": "37-40", "name": "offset", "description": "Distance from source point center to receiver group center (negative if opposite to direction in which line is shot)."},
+      {"offset": 41, "size": 4, "range": "41-44", "name": "gelev", "description": "Receiver group elevation; elevations above sea level are positive, below sea level are negative."},
+      {"offset": 45, "size": 4, "range": "45-48", "name": "selev", "description": "Surface elevation at source."},
+      {"offset": 49, "size": 4, "range": "49-52", "name": "sdepth", "description": "Source depth below surface (a positive number)."},
+      {"offset": 53, "size": 4, "range": "53-56", "name": "gdel", "description": "Datum elevation at receiver group."},
+      {"offset": 57, "size": 4, "range": "57-60", "name": "sdel", "description": "Datum elevation at source."},
+      {"offset": 61, "size": 4, "range": "61-64", "name": "swdep", "description": "Water depth at source."},
+      {"offset": 65, "size": 4, "range": "65-68", "name": "gwdep", "description": "Water depth at group."},
+      {"offset": 69, "size": 2, "range": "69-70", "name": "scalel", "description": "Scalar to be applied to all elevations and depths in bytes 41-68 to give real value. Scaler = 1, +/- 10, … +/- 10,000. Positive=multiplier; negative=divisor."},
+      {"offset": 71, "size": 2, "range": "71-72", "name": "scalco", "description": "Scalar to be applied to all coordinates in bytes 73-88 to give real value. Scaler = 1, +/- 10, … +/- 10,000. Positive=multiplier; negative=divisor."},
+      {"offset": 73, "size": 4, "range": "73-76", "name": "sx", "description": "Source coordinate - X."},
+      {"offset": 77, "size": 4, "range": "77-80", "name": "sy", "description": "Source coordinate - Y."},
+      {"offset": 81, "size": 4, "range": "81-84", "name": "gx", "description": "Group coordinate - X."},
+      {"offset": 85, "size": 4, "range": "85-88", "name": "gy", "description": "Group coordinate - Y."},
+      {"offset": 89, "size": 2, "range": "89-90", "name": "counit", "description": "Coordinate units: 1=length (m or ft), 2=seconds of arc, 3=decimal degrees, 4=degrees, minutes, seconds (DMS)."},
+      {"offset": 91, "size": 2, "range": "91-92", "name": "wevel", "description": "Weathering velocity (ft/s or m/s)."},
+      {"offset": 93, "size": 2, "range": "93-94", "name": "swevel", "description": "Subweathering velocity (ft/s or m/s)."},
+      {"offset": 95, "size": 2, "range": "95-96", "name": "sut", "description": "Uphole time at source (ms)."},
+      {"offset": 97, "size": 2, "range": "97-98", "name": "gut", "description": "Uphole time at group (ms)."},
+      {"offset": 99, "size": 2, "range": "99-100", "name": "sstat", "description": "Source static correction (ms)."},
+      {"offset": 101, "size": 2, "range": "101-102", "name": "gstat", "description": "Group static correction (ms)."},
+      {"offset": 103, "size": 2, "range": "103-104", "name": "tstat", "description": "Total static applied (ms). (Zero if no static has been applied.)"},
+      {"offset": 105, "size": 2, "range": "105-106", "name": "laga", "description": "Lag time A (ms). Time between end of 240-byte trace ID header and time break.Positive if time break occurs after end of header, negative if time break occurs before end of header."},
+      {"offset": 107, "size": 2, "range": "107-108", "name": "lagb", "description": "Lag Time B (ms). Time between time break and the initiation time of the energy source. May be positive or negative."},
+      {"offset": 109, "size": 2, "range": "109-110", "name": "delrt", "description": "Delay recording time (ms). Time between initiation time of energy source and time when recording of data samples begins. (For deep water work if data recording does not start at zero time.)"},
+      {"offset": 111, "size": 2, "range": "111-112", "name": "muts", "description": "Mute time – start (ms)."},
+      {"offset": 113, "size": 2, "range": "113-114", "name": "mute", "description": "Mute time – end (ms)."},
+      {"offset": 115, "size": 2, "range": "115-116", "name": "ns", "description": "Number of samples in this trace."},
+      {"offset": 117, "size": 2, "range": "117-118", "name": "dt", "description": "Sample interval in µsec for this trace."},
+      {"offset": 119, "size": 2, "range": "119-120", "name": "gain", "description": "Gain type of field instruments: 1=fixed, 2=binary, 3=floating point, 4-N = optional use."},
+      {"offset": 121, "size": 2, "range": "121-122", "name": "igc", "description": "Instrument gain constant (dB)."},
+      {"offset": 123, "size": 2, "range": "123-124", "name": "igi", "description": "Instrument early or initial gain (dB)."},
+      {"offset": 125, "size": 2, "range": "125-126", "name": "corr", "description": "Correlated: 1=no, 2=yes."},
+      {"offset": 127, "size": 2, "range": "127-128", "name": "sfs", "description": "Sweep frequency at start (Hz)."},
+      {"offset": 129, "size": 2, "range": "129-130", "name": "sfe", "description": "Sweep frequency at end (Hz)."},
+      {"offset": 131, "size": 2, "range": "131-132", "name": "slen", "description": "Sweep length (ms)."},
+      {"offset": 133, "size": 2, "range": "133-134", "name": "styp", "description": "Sweep type: 1=linear, 2=parabolic, 3=exponential, 4=other."},
+      {"offset": 135, "size": 2, "range": "135-136", "name": "stas", "description": "Sweep trace taper length at start (ms)."},
+      {"offset": 137, "size": 2, "range": "137-138", "name": "stae", "description": "Sweep trace taper length at end (ms)."},
+      {"offset": 139, "size": 2, "range": "139-140", "name": "tatyp", "description": "Taper type: 1=linear, 2=cosine squared, 3=other."},
+      {"offset": 141, "size": 2, "range": "141-142", "name": "afilf", "description": "Alias filter frequency (Hz), if used."},
+      {"offset": 143, "size": 2, "range": "143-144", "name": "afils", "description": "Alias filter slope (dB/octave)."},
+      {"offset": 145, "size": 2, "range": "145-146", "name": "nofilf", "description": "Notch filter frequency (Hz), if used."},
+      {"offset": 147, "size": 2, "range": "147-148", "name": "nofils", "description": "Notch filter slope (dB/octave)."},
+      {"offset": 149, "size": 2, "range": "149-150", "name": "lcf", "description": "Low cut frequency (Hz), if used."},
+      {"offset": 151, "size": 2, "range": "151-152", "name": "hcf", "description": "High cut frequency (Hz), if used."},
+      {"offset": 153, "size": 2, "range": "153-154", "name": "lcs", "description": "Low cut slope (dB/octave)."},
+      {"offset": 155, "size": 2, "range": "155-156", "name": "hcs", "description": "High cut slope (dB/octave)."},
+      {"offset": 157, "size": 2, "range": "157-158", "name": "year", "description": "Year data recorded."},
+      {"offset": 159, "size": 2, "range": "159-160", "name": "day", "description": "Day of year (Julian day for GMT and UTC time basis)."},
+      {"offset": 161, "size": 2, "range": "161-162", "name": "hour", "description": "Hour of day (24 hour clock)."},
+      {"offset": 163, "size": 2, "range": "163-164", "name": "minute", "description": "Minute of hour."},
+      {"offset": 165, "size": 2, "range": "165-166", "name": "sec", "description": "Second of minute."},
+      {"offset": 167, "size": 2, "range": "167-168", "name": "timbas", "description": "Time basis code: I=local, 2=GMT, 3=other, 4=UTC (Coordinated Universal Time)."},
+      {"offset": 169, "size": 2, "range": "169-170", "name": "trwf", "description": "Trace weighting factor – defined as 2 raised to the power (-N) volts for the least significant bit. (N = 0, 1, …. 32, 767.)"},
+      {"offset": 171, "size": 2, "range": "171-172", "name": "grnors", "description": "Geophone group number of roll switch position one."},
+      {"offset": 173, "size": 2, "range": "173-174", "name": "grnofr", "description": "Geophone group number of trace number one within original field record."},
+      {"offset": 175, "size": 2, "range": "175-176", "name": "grnlof", "description": "Geophone group number of last trace within original field record."},
+      {"offset": 177, "size": 2, "range": "177-178", "name": "gaps", "description": "Gap size (total number of groups dropped)."},
+      {"offset": 179, "size": 2, "range": "179-180", "name": "ofrav", "description": "Overtravel associated with taper at beginning or end of line: I=down (or behind), 2=up (or ahead)."},
+      {"offset": 181, "size": 4, "range": "181-184", "name": "-", "description": "X-coordinate of ensemble (CDP) position of this trace (scalar in Trace Header bytes 71-72 applies)."},
+      {"offset": 185, "size": 4, "range": "185-188", "name": "-", "description": "Y-coordinate of ensemble (CDP) position of this trace (scalar in Trace Header bytes 71-72 applies)."},
+      {"offset": 189, "size": 4, "range": "189-192", "name": "-", "description": "For 3-D poststack data, in-line number. If one in-line per SEG-Y file is being recorded, this value should be the same for all traces."},
+      {"offset": 193, "size": 4, "range": "193-196", "name": "-", "description": "For 3-D poststack data, cross-line number. This will typically be the same value as the ensemble (CDP) number in Trace Header bytes 21-24, but this does not have to be the case."},
+      {"offset": 197, "size": 4, "range": "197-200", "name": "-", "description": "Shotpoint number. This is probably only applicable to 2-D poststack data. Note that it is assumed that the shotpoint number refers to the source location nearest to the ensemble (CDP) location for a particular trace."},
+      {"offset": 201, "size": 2, "range": "201-202", "name": "-", "description": "Scalar to be applied to SP number in bytes 197-200 to give the real value. Positive=multiplier; negative=divisor; zero=no scaling."},
+      {"offset": 203, "size": 2, "range": "203-204", "name": "-", "description": "Trace value measurement unit: -1=other, 0=unknown, 1=Pascal (Pa), 2=Volts (V), 3=milliVolts (mV), 4=Amperes (A), 5=Meters (m), 6=meters/second, 7=meters/(sec power 2), 8=Newton (N), 9=Watt (W)."},
+      {"offset": 205, "size": 6, "range": "205-210", "name": "-", "description": "Transcuction constant – multiplicative constant used to convert the Data Trace samples to the Transduction Units (bytes 211-212)."},
+      {"offset": 211, "size": 2, "range": "211-212", "name": "-", "description": "Transduction units: -1=other, 0=unknown, 1=Pascal (Pa), 2=Volts (V), 3=milliVolts (mV), 4=Amperes (A), 5=Meters (m), 6=meters/second, 7=meters/(sec power 2), 8=Newton (N), 9=Watt (W)."},
+      {"offset": 213, "size": 2, "range": "213-214", "name": "-", "description": "Device/Trace identifier – unit number or id number of the device associated with the Data Trace. This allows traces to be associated across trace ensembles independent of the trace number (bytes 25-28)."},
+      {"offset": 215, "size": 2, "range": "215-216", "name": "-", "description": "Scalar to be applied to times specified in bytes 95-114 to give true time value in ms. Scalar = 1, +/- 10, … +/- 10,000. Positive=multiplier, negative=divisor, zero=no scaling."},
+      {"offset": 217, "size": 2, "range": "217-218", "name": "-", "description": "Source Type/Orientation: -1 to -n=other, 0=unknown, 1=vibrator vertical, 2=vibrator xline, 3=vibrator inline, 4=impulse vertical, 5=impulse xline, 6=impulse inline, 7=distributed impulse vertical, 8=distributed impulse xline, 9=distributed impulse inline."},
+      {"offset": 219, "size": 6, "range": "219-224", "name": "-", "description": "Source energy direction with respect to the source orientation. The positive orientation direction is in bytes 217-218. Energy direction is encoded in tenths of degrees (347.8 deg is encoded as 3478)."},
+      {"offset": 225, "size": 6, "range": "225-230", "name": "-", "description": "Source measurement."},
+      {"offset": 231, "size": 2, "range": "231-232", "name": "-", "description": "Source measurement unit: -1=other, 0=unknown, 1=Joule (J), 2=kilowatt (kW), 3=Pascal (Pa), 4=Bar (Bar), 4=Bar-meter (Bar-m), 5=Newton (N), 6=kilogram (kg)."},
+      {"offset": 233, "size": 8, "range": "233-240", "name": "-", "description": "Unassigned – for optional information."}
+    ];
+  </script>
+  <script id="6" type="module">
+    // Generated from the specBinaryHeader text of the original notebook.
+    // Offsets are byte positions within the 400 byte binary header.
+    const BINARY_HEADER_FIELDS = [
+      {"offset": "1-4", "description": "Job identification number."},
+      {"offset": "5-8", "description": "Line number. For 3-D poststack data, this will typically contain the in-line number."},
+      {"offset": "9-12", "description": "Reel number."},
+      {"offset": "13-14", "description": "Number of data traces per ensemble. Mandatory for prestack data."},
+      {"offset": "15-16", "description": "Number of auxiliary traces per ensemble. Mandatory for prestack data."},
+      {"offset": "17-18", "description": "Sample interval. Microseconds (µs) for time data, Hertz (Hz) for frequency data, meters (m) or feet (ft) for depth data."},
+      {"offset": "19-20", "description": "Sample interval of original field recording. Microseconds (µs) for time data, Hertz (Hz) for frequency data, meters (m) or feet (ft) for depth data."},
+      {"offset": "21-22", "description": "Number of samples per data trace. Note: The sample interval and number of samples in the Binary File Header should be for the primary set of seismic data traces in the file."},
+      {"offset": "23-24", "description": "Number of samples per data trace for original field recording."},
+      {"offset": "25-26", "description": "Data sample format code. Mandatory for all data. These formats are described in Appendix E. 1 = 4-byte IBM floating-point 2 = 4-byte, two's complement integer 3 = 2-byte, two's complement integer 4 = 4-byte fixed-point with gain (obsolete) 5 = 4-byte IEEE floating-point 6 = 8-byte IEEE floating-point 7 = 3-byte two’s complement integer 8 = 1-byte, two's complement integer 9 = 8-byte, two's complement integer 10 = 4-byte, unsigned integer 11 = 2-byte, unsigned integer 12 = 8-byte, unsigned integer 15 = 3-byte, unsigned integer 16 = 1-byte, unsigned integer"},
+      {"offset": "27-28", "description": "Ensemble fold — The expected number of data traces per trace ensemble (e.g. the CMP fold)."},
+      {"offset": "29-30", "description": "Trace sorting code (i.e. type of ensemble) : –1 = Other (should be explained in a user Extended Textual File Header stanza) 0 = Unknown 1 = As recorded (no sorting) 2 = CDP ensemble 3 = Single fold continuous profile 4 = Horizontally stacked 5 = Common source point 6 = Common receiver point 7 = Common offset point 8 = Common mid-point 9 = Common conversion point"},
+      {"offset": "31-32", "description": "Vertical sum code: 1 = no sum, 2 = two sum, …, N = M–1 sum (M = 2 to 32,767)"},
+      {"offset": "33-34", "description": "Sweep frequency at start (Hz)."},
+      {"offset": "35-36", "description": "Sweep frequency at end (Hz)."},
+      {"offset": "37-38", "description": "Sweep length (ms)."},
+      {"offset": "39-40", "description": "Sweep type code: 1 = linear 2 = parabolic 3 = exponential 4 = other"},
+      {"offset": "41-42", "description": "Trace number of sweep channel."},
+      {"offset": "43-44", "description": "Sweep trace taper length in milliseconds at start if tapered (the taper starts at zero time and is effective for this length)."},
+      {"offset": "45-46", "description": "Sweep trace taper length in milliseconds at end (the ending taper starts at sweep length minus the taper length at end)."},
+      {"offset": "47-48", "description": "Taper type: 1 = linear 2 = cosine squared 3 = other"},
+      {"offset": "49-50", "description": "Correlated data traces: 1 = no 2 = yes"},
+      {"offset": "51-52", "description": "Binary gain recovered: 1 = yes 2 = no"},
+      {"offset": "53-54", "description": "Amplitude recovery method: 1 = none 2 = spherical divergence 3 = AGC 4 = other"},
+      {"offset": "55-56", "description": "Measurement system: If Location Data stanzas are included in the file, this entry would normally agree with the Location Data stanza. If there is a disagreement, the last Location Data stanza is the controlling authority. If units are mixed, e.g. meters on surface, feet in depth, then a Location Data stanza is mandatory. 1 = Meters 2 = Feet"},
+      {"offset": "57-58", "description": "Impulse signal polarity 1 = Increase in pressure or upward geophone case movement gives negative number on trace. 2 = Increase in pressure or upward geophone case movement gives positive number on trace."},
+      {"offset": "59-60", "description": "Vibratory polarity code: Seismic signal lags pilot signal by: 1 = 337.5° to 22.5° 2 = 22.5° to 67.5° 3 = 67.5° to 112.5° 4 = 112.5° to 157.5° 5 = 157.5° to 202.5° 6 = 202.5° to 247.5° 7 = 247.5° to 292.5° 8 = 292.5° to 337.5°"},
+      {"offset": "61-64", "description": "Extended number of data traces per ensemble. If nonzero, this overrides the number of data traces per ensemble in bytes 3213–3214."},
+      {"offset": "65-68", "description": "Extended number of auxiliary traces per ensemble. If nonzero, this overrides the number of auxiliary traces per ensemble in bytes 3215–3216."},
+      {"offset": "69-72", "description": "Extended number of samples per data trace. If nonzero, this overrides the number of samples per data trace in bytes 3221–3222."},
+      {"offset": "73-80", "description": "Extended sample interval, IEEE double precision (64-bit). If nonzero, this overrides the sample interval in bytes 3217–3218 with the same units."},
+      {"offset": "81-88", "description": "Extended sample interval of original field recording, IEEE double precision (64- bit) . If nonzero, this overrides the sample interval of original field recording in bytes 3219–3220 with the same units."},
+      {"offset": "89-92", "description": "Extended number of samples per data trace in original recording. If nonzero, this overrides the number of samples per data trace in original recording in bytes 3223–3224."},
+      {"offset": "93-96", "description": "Extended ensemble fold. If nonzero, this overrides ensemble fold in bytes 3227–3228."},
+      {"offset": "97-100", "description": "The integer constant 1690906010 (0102030416). This is used to allow unambiguous detection of the byte ordering to expect for this SEG-Y file. For example, if this field reads as 6730598510 (0403020116) then the bytes in every Binary File Header, Trace Header and Trace Data field must be reversed as they are read, i.e. converting the endian-ness of the fields. If it reads 3362099510 (0201040316) then consecutive pairs of bytes need to be swapped in every Binary File Header, Trace Header and Trace Data field. The byte ordering of all other portions (the Extended Textual Header and Data Trailer) of the SEG-Y file is not affected by this field."},
+      {"offset": "101-300", "description": "Unassigned"},
+      {"offset": "301", "description": "Major SEG-Y Format Revision Number. This is an 8-bit unsigned value. Thus for SEG-Y Revision 2.0, as defined in this document, this will be recorded as 0216. This field is mandatory for all versions of SEG-Y, although a value of zero indicates “traditional” SEG-Y conforming to the 1975 standard."},
+      {"offset": "302", "description": "Minor SEG-Y Format Revision Number. This is an 8-bit unsigned value with a radix point between the first and second bytes. Thus for SEG-Y Revision 2.0, as defined in this document, this will be recorded as 0016. This field is mandatory for all versions of SEG-Y."},
+      {"offset": "303-304", "description": "Fixed length trace flag. A value of one indicates that all traces in this SEG-Y file are guaranteed to have the same sample interval, number of trace header blocks and trace samples, as specified in Binary File Header bytes 3217–3218 or 3281–3288, 3517–3518, and 3221–3222 or 3289–3292. A value of zero indicates that the length of the traces in the file may vary and the number of samples in bytes 115–116 of the Standard SEG-Y Trace Header and, if present, bytes 137–140 of SEG-Y Trace Header Extension 1 must be examined to determine the actual length of each trace. This field is mandatory for all versions of SEG-Y, although a value of zero indicates “traditional” SEGY conforming to the 1975 standard. Irrespective of this flag, it is strongly recommended that corect values for the number of samples per trace and sample interval appear in the appropriate trace Trace Header locations."},
+      {"offset": "305-306", "description": "Number of 3200-byte, Extended Textual File Header records following the Binary Header. If bytes 3521–3528 are nonzero, that field overrides this one. A value of zero indicates there are no Extended Textual File Header records (i.e. this file has no Extended Textual File Header(s)). A value of -1 indicates that there are a variable number of Extended Textual File Header records and the end of the Extended Textual File Header is denoted by an ((SEG: EndText)) stanza in the final record (Section 6.2). A positive value indicates that there are exactly that many Extended Textual File Header records. Note that, although the exact number of Extended Textual File Header records may be a useful piece of information, it will not always be known at the time the Binary Header is written and it is not mandatory that a positive value be recorded here or in bytes 3521–3528. It is however recommended to record the number of records if possible as this makes reading more effective and supports direct access to traces on disk files. In the event that this number exceeds 32767, set this field to –1 and bytes 3521–3528 to 3600+3200*(number of Extended Textual File Header records). Add a further 128 if a SEG-Y Tape Label is present."},
+      {"offset": "307-310", "description": "Maximum number of additional 240 byte trace headers. A value of zero indicates there are no additional 240 byte trace headers. The actual number for a given trace may be supplied in bytes 157–158 of SEG-Y Trace Header Extension 1."},
+      {"offset": "311-312", "description": "Time basis code: 1 = Local 2 = GMT (Greenwich Mean Time) 3 = Other, should be explained in a user defined stanza in the Extended Textual File Header 4 = UTC (Coordinated Universal Time) 5 = GPS (Global Positioning System Time)"},
+      {"offset": "313-320", "description": "Number of traces in this file or stream. (64-bit unsigned integer value) If zero, all bytes in the file or stream are part of this SEG-Y dataset."},
+      {"offset": "321-328", "description": "Byte offset of first trace relative to start of file or stream if known, otherwise zero. (64-bit unsigned integer value) This byte count will include the initial 3600 bytes of the Textual and this Binary File Header plus the Extended Textual Header if present. When nonzero, this field overrides the byte offset implied by any nonnegative number of Extended Textual Header records present in bytes 3505–3506."},
+      {"offset": "329-332", "description": "Number of 3200-byte data trailer stanza records following the last trace (4 byte signed integer). A value of 0 indicates there are no trailer records. A value of -1 indicates an undefined number of trailer records (0 or more) following the data. It is, however, recommended to record the number of trailer records if possible as this makes reading more efficient."},
+      {"offset": "333-400", "description": "Unassigned"}
+    ];
+  </script>
+  <script id="7" type="module">
+    // Example SEG-Y file stk00819t_first5.sgy (5 traces), embedded as base64 so the notebook is self-contained.
+    const exampleSgyBase64 = "w0DxQMPTycXV40BAQEBAQEBAQEBAQEBAQEBAQMPW1NfB1ehAQEBAQEBAQEBAQEBAw9nF5kDV1ktAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDDQPJA08nVxUBAQEBAQEBAQEDB2cXBQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDUwddAycRLQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMNA80DZxcXTQNXWS0BAQEBAQEBAQMTB6GDi48HZ40DWxkDZxcXTQEBAQEBAQOjFwdlAQEBAQEDWwuLF2eXF2UBAQEBAQEBAQEBAQEBAQEBAw0D0QMnV4uPZ5NTF1eN6QNTGx0BAQEBAQEBAQEDU1sTF00BAQEBAQEBAQEBAQEBA4sXZycHTQNXWS0BAQEBAQEBAQEBAQEBAQEBAQEBAQEDDQPVAxMHjwUDj2cHDxeJh2cXD1tnEQEBAQMHk58nTycHZ6EDj2cHDxeJh2cXD1tnEQEBAQEBAQMPE10DG1tPEQEBAQEBAQEBAQEBAQEBAQMNA9kDiwdTX08VAydXjxdnlwdNAQEBAQNTiQEDiwdTX08XiYePZwcPFQEBAQEDCyePiYcnVQEBAQEDC6OPF4mHiwdTX08VAQEBAQEBAQEBAw0D3QNnFw9bZxMnVx0DG1tnUweNAQEBAQMbW2dTB40DjyMniQNnFxdNAQEBAQEDUxcHi5NnF1MXV40Di6OLjxdRAQEBAQEBAQEBAQEBAQEDDQPhA4sHU19PFQMPWxMV6QMbT1sHjydXHQNfjQEBAQEDGyefFxEDX40BAQEBAxsnnxcRA1+Ngx8HJ1UBAQEBAw9bZ2cXTwePFxEBAQEBAQMNA+UDHwcnVQEBA4+jXxXpAxsnnxcRAQEBAwsnVwdnoQEBAQEDG09bB48nVx0DX1snV40BAQEBA1uPIxdlAQEBAQEBAQEBAQEBAQEBAQEBAw/HwQMbJ0+PF2eJ6QMHTycHiQEBAQEDI6UBA1dbjw8hAQEBAQMjpQEBAQEDCwdXEQEBAQEDI6UBAQEDi09bXxUBAQEBAQEBAQEBAQEBAQEDD8fFA4tbk2cPFekDj6NfFQEBAQEBAQEBAQEDV5NTCxdlh19bJ1eNAQEDX1snV40DJ1ePF2eXB00BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPx8kBAQEBA18Hj48XZ1UBAQEBAQEBAQEBAQEBAQEBAQEBAQNPF1cfjyEBAQEBAQEBAQObJxOPIQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/HzQOLmxcXXekDi48HZ40BAQEBAyOlAQMXVxEBAQEBAyOlAQNPF1cfjyEBAQEBA1OJAQMPIwdXVxdNA1dZLQEBAQOPo18VAQEBAQEBAQEDD8fRA48HXxdl6QOLjwdnjQNPF1cfjyEBAQEBA1OJAQMXVxEDTxdXH48hAQEBAQNTiQEDj6NfFQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPx9UDi19nFwcR6QNbGxuLF40BAQEBAQEBA1MHnQMTJ4uPB1cPFQEBAQEBAQEBAx9nW5NdAydXjxdnlwdNAQEBAQEBAQEBAQEBAQEBAQEBAw/H2QMfF1tfI1tXF4npA18XZQMfZ1uTXQEBAQOLXwcPJ1cdAQEBAQMbZxdjkxdXD6EBAQEBA1MbHQEBAQEBA1NbExdNAQEBAQEBAQEBAQEDD8fdAQEBA18Hj48XZ1UBAQEBAQEBAQEBAQEBA08XVx+PIQEBAQEBAQEBA5snE48hAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPx+EDj2cHDxeJA4tbZ48XEQMLoekDZxcPW2cRAQEBAQEDDxNdAQEBAQNbjyMXZQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/H5QNTB10DX2dbRxcPjydbVQEBAQEBAQEBAQOnW1cVAycRAQEBAQEBAQMPW1tnEydXB48VA5NXJ4+JAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8vBAwsXHydXVydXHQOLI1uPX1snV40BN1sLixdnlxdl94l16QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPy8UDF1cTJ1cdA4sjW49fWydXjQEBAQE3WwuLF2eXF2X3iXXpAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/LyQMTJ2cXD48nW1UDWxkDTydXFekBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8vNAw9bk1ePoQEBAQEBAQEBAQEBAQEBA4uPB48VAQEBAQEBAQEBAQEBAQOLk2eXF6EDV1ktAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPy9EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/L1QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8vZAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPy90BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/L4QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8vlAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPz8EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/PxQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8/JAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPz80BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/P0QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8/VAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPz9kBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/P3QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDD8/hAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQMPz+UBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAw/TwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAAAAAABvxQAAAAEAAQAAA+gAAAu4AAAAAQABAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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";
+    const exampleSgy = Uint8Array.from(atob(exampleSgyBase64), (c) => c.charCodeAt(0)).buffer;
+  </script>
+  <script id="8" type="module">
+    const file = view(Inputs.file({label: "SEG-Y file", accept: ".sgy,.segy"}));
+  </script>
+  <script id="9" type="module">
+    const exampleName = "stk00819t_first5.sgy";
+    const sourceName = file ? file.name : `${exampleName} (included example file)`;
+    const progress = html`<progress value=0 max=1 style="width:100%"></progress>`;
+    display(progress);
+    const segy = new SegY(
+      file
+        ? await readFile(file, (p) => (progress.value = p))
+        : exampleSgy
+    );
+    progress.remove();
+  </script>
+  <script id="10" type="module">
+    display(html`<p>File <b>${sourceName}</b> has <b>${segy.buffer.byteLength.toLocaleString()}</b> bytes, ${segy.traceCount.toLocaleString()} traces.${file ? "" : " Choose a file above to analyse your own data instead."}</p>`);
+  </script>
+  <script id="11" type="text/markdown">
+    ## 2. Text header
+  </script>
+  <script id="12" type="module">
+    if (segy) {
+      const h = decodeTextHeader(segy.buffer);
+      display(html`<p>Encoding detected: <b>${h.encoding}</b></p>
+        <pre style="font-size:10px;line-height:1.2">${h.lines.join("\n")}</pre>`);
+    }
+  </script>
+  <script id="13" type="text/markdown">
+    ## 3. Binary Header
+  </script>
+  <script id="14" type="module">
+    const customOffset = view(Inputs.number([1, 399], {label: "custom offset", value: 27, step: 1, placeholder: "1 to 399"}));
+  </script>
+  <script id="15" type="module">
+    if (segy) {
+      const b = segy.binary;
+      const rows = [
+        {offset: "1-4", description: "job id", value: b.jobId},
+        {offset: "5-8", description: "(in-)line number", value: b.lineNo},
+        {offset: "9-12", description: "reel number", value: b.reelNo},
+        {offset: "17-18", description: "sample interval in µs", value: b.dt},
+        {offset: "21-22", description: "number of samples", value: b.ns},
+        {offset: "25-26", description: "data format code", value: `${b.format} (${segy.fmt.txt})`},
+        {offset: "301-302", description: "SEG-Y revision", value: `${b.revMajor}.${b.revMinor}`},
+        {offset: "303-304", description: "trace length fixed", value: `${b.fixedLength} (${b.fixedLength ? "use 21-22" : "use 115-116 in trace header"})`},
+        {offset: "-", description: "byte order", value: segy.littleEndian ? "little endian" : "big endian"}
+      ];
+      if (Number.isInteger(customOffset) && customOffset >= 1 && customOffset <= 399) {
+        const c = segy.binaryValue(customOffset);
+        rows.push({offset: `${customOffset}-${customOffset + 1}`, description: "custom field 16bit", value: c.int16 ?? "out of range"});
+        rows.push({offset: `${customOffset}-${customOffset + 3}`, description: "custom field 32bit", value: c.int32 ?? "out of range"});
+      } else {
+        rows.push({offset: "-", description: "custom field", value: "enter an offset from 1 to 399"});
+      }
+      display(Inputs.table(rows, {layout: "auto", rows: 20}));
+    }
+  </script>
+  <script id="16" type="text/markdown">
+    ## 4. Trace Header Values and Plots
+
+    Values of the trace header fields for the first trace, the selected trace, and the last trace. The custom offset adds 16 bit and 32 bit values at any byte offset of the 240 byte trace header.
+  </script>
+  <script id="17" type="module">
+    const traceNo = view(Inputs.range([1, segy?.traceCount ?? 1], {label: "trace to analyse", step: 1, value: Math.floor((segy?.traceCount ?? 1) / 2)}));
+  </script>
+  <script id="18" type="module">
+    const traceOffset = view(Inputs.number([1, 237], {label: "custom offset", value: 21, step: 1, placeholder: "1 to 237"}));
+  </script>
+  <script id="19" type="module">
+    if (segy) {
+      const last = segy.traceCount;
+      const custom = Number.isInteger(traceOffset) && traceOffset >= 1 && traceOffset <= 237;
+      const rows = [];
+      if (custom) {
+        rows.push({offset: traceOffset, shortName: "custom 16 bit",
+          first: segy.headerInt(1, traceOffset, 2), value: segy.headerInt(traceNo, traceOffset, 2), last: segy.headerInt(last, traceOffset, 2)});
+        rows.push({offset: traceOffset, shortName: "custom 32 bit",
+          first: segy.headerInt(1, traceOffset, 4), value: segy.headerInt(traceNo, traceOffset, 4), last: segy.headerInt(last, traceOffset, 4)});
+      } else {
+        rows.push({offset: "-", shortName: "custom", first: "enter an offset from 1 to 237", value: "", last: ""});
+      }
+      for (const f of TRACE_HEADER_FIELDS) {
+        rows.push({offset: f.offset, shortName: f.name,
+          first: segy.headerValue(1, f), value: segy.headerValue(traceNo, f), last: segy.headerValue(last, f)});
+      }
+      display(Inputs.table(rows, {rows: 20, layout: "auto"}));
+    }
+  </script>
+  <script id="20" type="module">
+    const offsetX = view(Inputs.number([1, 237], {label: "offset for x", value: 73, step: 4}));
+    const offsetY = view(Inputs.number([1, 237], {label: "offset for y", value: 77, step: 4}));
+  </script>
+  <script id="21" type="module">
+    if (segy) {
+      const pts = segy.coordinates(offsetX, offsetY);
+      display(html`<p>${pts.length.toLocaleString()} of ${segy.traceCount.toLocaleString()} traces shown</p>`);
+      display(Plot.plot({
+        width,
+        height: 400,
+        grid: true,
+        inset: 10,
+        x: {label: `offset ${offsetX}`},
+        y: {label: `offset ${offsetY}`},
+        marks: [Plot.dot(pts, {x: "x", y: "y", r: 1.5, fill: "steelblue", tip: true})]
+      }));
+    }
+  </script>
+  <script id="22" type="text/markdown">
+    ## 5. Trace Data
+
+    Shows the trace selected in section 4.
+  </script>
+  <script id="23" type="module">
+    if (segy) {
+      const s = segy.samples(traceNo);
+      const n = s.values.length;
+      const maxSamples = Math.min(500, n);
+      const stride = Math.max(1, Math.floor(n / maxSamples));
+
+      display(Inputs.table([{"samples min": s.min, "samples max": s.max}]));
+
+      // Histogram of up to 500 non-zero samples
+      const nonZero = [];
+      for (let i = 0; i < n; i += stride) if (s.values[i] !== 0) nonZero.push(s.values[i]);
+      display(Plot.plot({
+        width,
+        height: 140,
+        title: `histogram (zeros not counted), ${nonZero.length} out of ${n} samples`,
+        y: {label: "count"},
+        x: {label: "amplitude"},
+        marks: [Plot.rectY(nonZero, Plot.binX({y: "count"}, {thresholds: 30, fill: "steelblue", tip: true}))]
+      }));
+
+      // Color coded amplitude strip, one cell per (subsampled) sample
+      const strip = [];
+      for (let i = 0; i < n; i += stride) strip.push({index: i, data: s.values[i]});
+      display(Plot.plot({
+        width,
+        height: 90,
+        marginBottom: 35,
+        x: {label: "sample number"},
+        y: {axis: null},
+        color: {type: "linear", scheme: "ylgnbu", legend: true, label: "amplitude"},
+        marks: [Plot.rect(strip, {x1: "index", x2: (d) => d.index + stride, fill: "data", tip: true})]
+      }));
+    }
+  </script>
+  <script id="24" type="text/markdown">
+    ## 6. Section
+  </script>
+  <script id="25" type="module">
+    const center = view(Inputs.range([1, segy?.traceCount ?? 1], {label: "center trace", step: 1, value: Math.floor((segy?.traceCount ?? 1) / 2)}));
+    const contrast = view(Inputs.range([0, 0.9], {label: "contrast", step: 0.05, value: 0.2}));
+    const brightness = view(Inputs.range([0.1, 0.9], {label: "brightness", step: 0.02, value: 0.5}));
+    const smooth = view(Inputs.toggle({label: "smooth samples", value: true}));
+    const invert = view(Inputs.toggle({label: "invert grey scale", value: false}));
+  </script>
+  <script id="26" type="module">
+    // Rebuilt only when the file, center trace or page width changes.
+    const section = segy.section(center);
+    display(html`<p>${section.cols.length} traces by ${section.cols[0].length} samples, time step ${section.dt.toFixed(4)} s.</p>`);
+    const viewer = sectionViewer(section, {width});
+    display(viewer);
+    display(html`<small>Wheel to zoom, drag to pan, double click to reset.</small>`);
+  </script>
+  <script id="27" type="module">
+    // Contrast, brightness, smooth and invert update the existing view, so zoom and pan are kept.
+    viewer.update({contrast, brightness, smooth, invert});
+  </script>
+  <script id="28" type="text/markdown">
+    ## SEG-Y trace header table
+
+    The 87 trace header fields of the SEG-Y specification.
+  </script>
+  <script id="29" type="module">
+    display(Inputs.table(TRACE_HEADER_FIELDS.map((f) => ({
+      offset: f.range,
+      size: f.size,
+      name: f.name,
+      description: f.description
+    })), {rows: 100, layout: "auto", width: {description: 520}}));
+  </script>
+  <script id="30" type="text/markdown">
+    ## SEG-Y Binary Header table
+  </script>
+  <script id="31" type="module">
+    display(Inputs.table(BINARY_HEADER_FIELDS, {rows: 100, layout: "auto", width: {description: 700}}));
+  </script>
+  <script id="32" type="text/markdown">
+    © 2026 Andreas Plesch, Waltham, MA
+  </script>
+</notebook>
